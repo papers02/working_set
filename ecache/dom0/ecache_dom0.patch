@@ -1,0 +1,367 @@
+#this patch shoud be applied on linux-3.6
+#download it from here https://www.linux-mips.org/pub/linux/mips/kernel/v3.x/linux-3.6.tar.gz
+
+diff -ru test/geiger/linux-3.6/drivers/block/xen-blkback/blkback.c test/e-cache/Dom0/linux-3.6/drivers/block/xen-blkback/blkback.c
+--- test/geiger/linux-3.6/drivers/block/xen-blkback/blkback.c	2012-10-01 01:47:46.000000000 +0200
++++ test/e-cache/Dom0/linux-3.6/drivers/block/xen-blkback/blkback.c	2016-06-17 00:05:10.597613039 +0200
+@@ -42,6 +42,7 @@
+ 
+ #include <xen/events.h>
+ #include <xen/page.h>
++#include <xen/xen.h>
+ #include <asm/xen/hypervisor.h>
+ #include <asm/xen/hypercall.h>
+ #include "common.h"
+@@ -490,6 +491,112 @@
+ }
+ 
+ 
++static struct working_set *ws = NULL;
++static unsigned int compteur = 0;
++static void dispatch_eviction_io(struct xen_blkif *blkif, struct pending_req * pending_req, struct blkif_request req)
++{
++	//char *buffer, *buffer_copy = NULL;
++	struct page *buffer;
++	char *buffer_copy = NULL;
++	struct mapping *map;
++	struct cache *cache_entry;
++	struct ghost_buffer *buffer_entry;
++	struct seg_buf seg[BLKIF_MAX_SEGMENTS_PER_REQUEST];
++	unsigned long page_adress;
++	unsigned int i = 0;
++	pending_req->blkif     = blkif;
++	pending_req->id        = req.u.rw.id;
++	pending_req->operation = req.operation;
++	pending_req->status    = BLKIF_RSP_OKAY;
++	pending_req->nr_pages  = req.u.rw.nr_segments;
++//	printk("id: %lu\n", req.u.rw.id);
++	xen_blkbk_map(&req, pending_req, seg);
++	 for(i = 0; i< req.u.rw.nr_segments; i++)
++     {
++
++		page_adress = pfn_to_mfn(page_to_pfn(blkbk->pending_page(pending_req, i)));
++//		if(buffer_copy == NULL)
++	//		printk("buffer_copy is null\n");
++
++		map = radix_tree_lookup(ws->map_tree, page_adress);
++		if(map != NULL)
++		{
++
++//			cache_entry = kmalloc(sizeof(struct cache),GFP_KERNEL);
++			buffer_entry= kmalloc(sizeof(struct ghost_buffer),GFP_KERNEL);
++//			cache_entry->sector = map->sector;
++
++//			cache_entry->major = map->major;
++///			cache_entry->minor = map->minor;
++
++//			buffer_copy = kzalloc(4096,GFP_KERNEL);
++
++//			buffer = kmap(blkbk->pending_page(pending_req, i));
++/*			if(buffer !=  NULL && buffer_copy!=NULL)
++			{
++				memcpy(buffer_copy, buffer, 4096);
++				cache_entry->buffer = buffer_copy;
++	//			printk("%s\n\n", buffer_copy);
++			}
++			kunmap(buffer);
++*/
++			buffer_entry->sector = map->sector;
++			buffer_entry->major = map->major;
++			buffer_entry->minor = map->minor;
++			buffer_entry->accessed = 0;
++			map->sector = 0xffffffff;
++	//		radix_tree_delete(ws->map_tree,page_adress);
++//			cache_entry->count = compteur;
++//			compteur++;
++/*			if(ws->taille_cache >= ws->cache_size)
++			{
++				list_del(ws->cachehead->next);
++				list_add_tail(&cache_entry->list, ws->cachehead);
++			}else
++			{
++				list_add_tail(&cache_entry->list, ws->cachehead);
++				ws->taille_cache++;
++			}*/
++			list_add(&buffer_entry->list, ws->buffer_head);
++		}else
++			printk("page no mapping\n");
++
++	}
++	xen_blkbk_unmap(pending_req);
++	free_req(pending_req);
++	make_response(blkif, req.u.rw.id, req.operation, BLKIF_RSP_OKAY);
++}
++
++#define HIST_SIZE 200
++int estimate_ws(void *arg)
++{
++	unsigned int i, total = 0, curr = 0, wos, j;
++	while (1) {
++		total = 1;
++		curr = 1;
++		printk("estimator\n\n");
++		for(i = 0; i<HIST_SIZE;i++)
++		{
++				printk("hist[%u] = %u\n", i, ws->hist[i]);
++				total += ws->hist[i];
++		}
++		for(j = 0; j<HIST_SIZE;j++)
++		{
++			curr += ws->hist[j];
++			wos = (total-curr)*100/total;
++			if(wos < 2)
++			{
++				printk("tot : %u curr: %u wos: %u ws = %u\n", total, curr, wos, j*4);
++				break;
++			}
++		}
++		for(i=0; i<HIST_SIZE;i++)
++			ws->hist[i] = 0;
++		msleep(60000);
++	}
++	return 0;
++}
++
+ 
+ /*
+  * Function to copy the from the ring buffer the 'struct blkif_request'
+@@ -543,17 +650,26 @@
+ 
+ 		/* Apply all sanity checks to /private copy/ of request. */
+ 		barrier();
+-		if (unlikely(req.operation == BLKIF_OP_DISCARD)) {
++
++		switch (req.operation) {
++		case BLKIF_OP_DISCARD:
+ 			free_req(pending_req);
+ 			if (dispatch_discard_io(blkif, &req))
+-				break;
+-		} else if (dispatch_rw_block_io(blkif, &req, pending_req))
++				goto done;
+ 			break;
++		case BLKIF_OP_EVICTION:
++			dispatch_eviction_io(blkif, pending_req, req);
++			goto done;
++		default:
++			if (dispatch_rw_block_io(blkif, &req, pending_req))
++					goto done;
++				break;
++		}
+ 
+ 		/* Yield point for this unbounded loop. */
+ 		cond_resched();
+ 	}
+-
++done:
+ 	return more_to_do;
+ }
+ 
+@@ -573,6 +689,7 @@
+ 
+ 	return more_to_do;
+ }
++
+ /*
+  * Transmutation of the 'struct blkif_request' to a proper 'struct bio'
+  * and call the 'submit_bio' to pass it to the underlying storage.
+@@ -590,7 +707,27 @@
+ 	int operation;
+ 	struct blk_plug plug;
+ 	bool drain = false;
+-
++	unsigned long page_adress;
++	struct mapping *map;
++	struct cache *pos;
++	struct ghost_buffer *pos1;
++	unsigned int dist = 0;
++	if(ws == NULL)
++	{
++		ws = kmalloc(sizeof(struct working_set),GFP_KERNEL);
++		ws->cache_size = (1<<24);
++		ws->map_tree = kmalloc(sizeof(struct radix_tree_root),GFP_KERNEL);
++		INIT_RADIX_TREE(ws->map_tree, GFP_ATOMIC);
++		ws->cachehead = kmalloc(sizeof(struct list_head),GFP_KERNEL);
++		INIT_LIST_HEAD(ws->cachehead);
++		ws->buffer_head = kmalloc(sizeof(struct list_head),GFP_KERNEL);
++		INIT_LIST_HEAD(ws->buffer_head);
++		ws->hist = kzalloc(HIST_SIZE*sizeof(unsigned int), GFP_KERNEL);
++		ws->ws_d = kthread_run(estimate_ws, NULL, "working-set");
++	}
++	struct radix_tree_root *map_tree = ws->map_tree;
++	struct list_head *cachehead = ws->cachehead;
++	unsigned int *hist = ws->hist;
+ 	switch (req->operation) {
+ 	case BLKIF_OP_READ:
+ 		blkif->st_rd_req++;
+@@ -686,6 +823,73 @@
+ 	xen_blkif_get(blkif);
+ 
+ 	for (i = 0; i < nseg; i++) {
++		dist = 0;
++		if(operation == READ)
++		{
++			list_for_each_entry(pos1,ws->buffer_head, list)
++			{
++				if(pos1->accessed == 0)
++                                {
++					dist++;
++					if(preq.sector_number == pos1->sector && MAJOR(preq.dev) == pos1->major && MINOR(preq.dev) == pos1->minor)
++					{
++						unsigned int index1 = dist/1024;
++//						printk("hit %u\n", index1);
++						if(index1 < HIST_SIZE)
++							hist[index1]++;
++						pos1->accessed = 1;
++					}
++				}
++			}
++		}
++		page_adress = pfn_to_mfn(page_to_pfn(blkbk->pending_page(pending_req, i)));
++		map = radix_tree_lookup(map_tree,page_adress);
++		if(map == NULL)
++		{
++			map = kmalloc(sizeof(struct mapping), GFP_KERNEL);
++			map->sector = preq.sector_number;
++			map->major = MAJOR(preq.dev);
++			map->minor = MINOR(preq.dev);
++			radix_tree_insert(map_tree,page_adress, map);
++		}else
++		{
++			
++			map->sector = preq.sector_number;
++			map->major = MAJOR(preq.dev);
++			map->minor = MINOR(preq.dev);
++
++		}
++
++/*		list_for_each_entry(pos,cachehead, list)
++		{
++		//	printk("compteur = %u\n", pos->count);
++			if(preq.sector_number == pos->sector && map->major == pos->major && map->minor == pos->minor)
++			
++			{
++				if(operation == READ)
++				{
++//					printk("hit \n");
++				//	struct page *tmp = kmap(blkbk->pending_page(pending_req, i));
++					char * tmp = page_address(blkbk->pending_page(pending_req, i))+(seg[i].buf & ~PAGE_MASK);
++					if(tmp != NULL)
++					{
++						memcpy(tmp, pos->buffer, 4096);
++					//	kunmap(tmp);
++						list_del(&pos->list);
++						ws->taille_cache --;
++//						goto next_sector;
++
++					}
++
++				}
++
++				list_del(&pos->list);
++				ws->taille_cache --;
++				break;
++
++			}
++		}*/
++//		printk("dist = %u taille_cache = %u\n", dist, ws->taille_cache);
+ 		while ((bio == NULL) ||
+ 		       (bio_add_page(bio,
+ 				     blkbk->pending_page(pending_req, i),
+@@ -702,13 +906,13 @@
+ 			bio->bi_end_io  = end_block_io_op;
+ 			bio->bi_sector  = preq.sector_number;
+ 		}
+-
++		next_sector:
+ 		preq.sector_number += seg[i].nsec;
+ 	}
+ 
+ 	/* This will be hit if the operation was a flush or discard. */
+ 	if (!bio) {
+-		BUG_ON(operation != WRITE_FLUSH);
++//		BUG_ON(operation != WRITE_FLUSH);
+ 
+ 		bio = bio_alloc(GFP_KERNEL, 0);
+ 		if (unlikely(bio == NULL))
+@@ -730,7 +934,10 @@
+ 	blk_start_plug(&plug);
+ 
+ 	for (i = 0; i < nbio; i++)
+-		submit_bio(operation, biolist[i]);
++	{
++		if(biolist[i] != NULL)
++			submit_bio(operation, biolist[i]);
++	}
+ 
+ 	/* Let the I/Os go.. */
+ 	blk_finish_plug(&plug);
+diff -ru test/geiger/linux-3.6/drivers/block/xen-blkback/common.h test/e-cache/Dom0/linux-3.6/drivers/block/xen-blkback/common.h
+--- test/geiger/linux-3.6/drivers/block/xen-blkback/common.h	2012-10-01 01:47:46.000000000 +0200
++++ test/e-cache/Dom0/linux-3.6/drivers/block/xen-blkback/common.h	2016-06-09 00:11:02.848689070 +0200
+@@ -158,10 +158,52 @@
+ 	struct block_device	*bdev;
+ 	/* Cached size parameter. */
+ 	sector_t		size;
+-	bool			flush_support;
+-	bool			discard_secure;
++	
++	unsigned int		flush_support:1;
++	unsigned int		discard_secure:1;
++
++//	bool			flush_support;
++//	bool			discard_secure;
+ };
+ 
++struct mapping
++ {
++ 	unsigned long sector;
++ 	unsigned int major;
++ 	unsigned int minor;
++ };
++ 
++ struct ghost_buffer
++ {
++ 	struct list_head list;
++ 	unsigned long sector;
++ 	unsigned int major;
++ 	unsigned int minor;
++ 	unsigned int accessed;
++ };
++ 
++ struct cache
++ {
++ 	struct list_head list;
++ 	unsigned long sector;
++ 	unsigned int major;
++ 	unsigned int minor;
++ 	char* buffer;
++ 	unsigned int count;
++ 	//struct page* buffer;
++ };
++ 
++struct working_set{
++ 	struct list_head *cachehead;
++ 	struct list_head *buffer_head;
++ 	struct radix_tree_root *map_tree;
++ 	unsigned long cache_size;
++ 	unsigned int *hist;
++	unsigned int taille_cache ;
++ 	struct task_struct	*ws_d;
++ };
++
++
+ struct backend_info;
+ 
+ struct xen_blkif {
+diff -ru test/geiger/linux-3.6/include/xen/interface/io/blkif.h test/e-cache/Dom0/linux-3.6/include/xen/interface/io/blkif.h
+--- test/geiger/linux-3.6/include/xen/interface/io/blkif.h	2012-10-01 01:47:46.000000000 +0200
++++ test/e-cache/Dom0/linux-3.6/include/xen/interface/io/blkif.h	2016-06-09 00:20:24.300754334 +0200
+@@ -101,7 +101,7 @@
+  * BLKIF_DISCARD_SECURE must be set in the blkif_request_trim.
+  */
+ #define BLKIF_OP_DISCARD           5
+-
++#define BLKIF_OP_EVICTION	   6
+ /*
+  * Maximum scatter/gather segments per request.
+  * This is carefully chosen so that sizeof(struct blkif_ring) <= PAGE_SIZE.

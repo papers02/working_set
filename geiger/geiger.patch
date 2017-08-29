@@ -1,0 +1,368 @@
+#this patch shoud be applied on linux-3.6
+#download it from here https://www.linux-mips.org/pub/linux/mips/kernel/v3.x/linux-3.6.tar.gz
+
+diff -ru linux-3.6/drivers/block/brd.c linux-3.6_1/drivers/block/brd.c
+--- linux-3.6/drivers/block/brd.c	2012-10-01 01:47:46.000000000 +0200
++++ linux-3.6_1/drivers/block/brd.c	2017-04-17 07:08:26.479219054 +0200
+@@ -19,6 +19,7 @@
+ #include <linux/radix-tree.h>
+ #include <linux/fs.h>
+ #include <linux/slab.h>
++#include <linux/delay.h>
+ 
+ #include <asm/uaccess.h>
+ 
+@@ -26,6 +27,14 @@
+ #define PAGE_SECTORS_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
+ #define PAGE_SECTORS		(1 << PAGE_SECTORS_SHIFT)
+ 
++unsigned long r_delay = 0;
++module_param(r_delay, ulong, 0);
++MODULE_PARM_DESC(r_delay, "The delay for each IO read");
++
++unsigned long w_delay = 0;
++module_param(w_delay, ulong, 0);
++MODULE_PARM_DESC(w_delay, "The delay for each IO write");
++
+ /*
+  * Each block ramdisk device has a radix_tree brd_pages of pages that stores
+  * the pages containing the block device's contents. A brd page's ->index is
+@@ -311,9 +320,17 @@
+ 
+ 	mem = kmap_atomic(page);
+ 	if (rw == READ) {
++		if (r_delay < 1000)
++                        ndelay(r_delay);
++                else
++                        udelay(r_delay / 1000);
+ 		copy_from_brd(mem + off, brd, sector, len);
+ 		flush_dcache_page(page);
+ 	} else {
++		if (w_delay < 1000)
++                        ndelay(w_delay);
++                else
++                        udelay(w_delay / 1000);
+ 		flush_dcache_page(page);
+ 		copy_to_brd(brd, mem + off, sector, len);
+ 	}
+@@ -350,6 +367,7 @@
+ 
+ 	bio_for_each_segment(bvec, bio, i) {
+ 		unsigned int len = bvec->bv_len;
++		
+ 		err = brd_do_bvec(brd, bvec->bv_page, len,
+ 					bvec->bv_offset, rw, sector);
+ 		if (err)
+diff -ru linux-3.6/drivers/block/xen-blkback/blkback.c linux-3.6_1/drivers/block/xen-blkback/blkback.c
+--- linux-3.6/drivers/block/xen-blkback/blkback.c	2012-10-01 01:47:46.000000000 +0200
++++ linux-3.6_1/drivers/block/xen-blkback/blkback.c	2016-06-08 22:57:15.509590147 +0200
+@@ -42,6 +42,7 @@
+ 
+ #include <xen/events.h>
+ #include <xen/page.h>
++#include <xen/xen.h>
+ #include <asm/xen/hypervisor.h>
+ #include <asm/xen/hypercall.h>
+ #include "common.h"
+@@ -573,6 +574,40 @@
+ 
+ 	return more_to_do;
+ }
++
++
++static struct working_set *ws = NULL;
++#define HIST_SIZE 100
++int estimate_ws(void *arg)
++{
++	unsigned int i, total = 0, curr = 0, wos, j;
++	while (1) {
++		total = 1;
++		curr = 1;
++		for(i = 0; i<HIST_SIZE;i++)
++			total += ws->hist[i];
++		for(j = 0; j<HIST_SIZE;j++)
++		{
++			curr += ws->hist[j];
++			wos = (total-curr)*100/total;
++			if(wos < 6)
++			{
++				printk("tot : %u curr: %u wos: %u ws = %u\n", total, curr, wos, j*4);
++				break;
++			}
++	
++//				ws->hist[j] = ws->hist[j]*69/100;
++		}	
++		//		msleep(6000)
++		for(i = 0; i<HIST_SIZE;i++)
++			ws->hist[i] = 0;
++//		printk("hist[%u] = %lu\n", i,ws->hist[i]);
++		msleep(60000);
++	}
++	return 0;
++}
++
++
+ /*
+  * Transmutation of the 'struct blkif_request' to a proper 'struct bio'
+  * and call the 'submit_bio' to pass it to the underlying storage.
+@@ -581,6 +616,10 @@
+ 				struct blkif_request *req,
+ 				struct pending_req *pending_req)
+ {
++//	struct radix_tree_root *map_tree = ws->map_tree; 
++//       struct list_head *cachehead = ws->cachehead;	
++
++
+ 	struct phys_req preq;
+ 	struct seg_buf seg[BLKIF_MAX_SEGMENTS_PER_REQUEST];
+ 	unsigned int nseg;
+@@ -590,6 +629,25 @@
+ 	int operation;
+ 	struct blk_plug plug;
+ 	bool drain = false;
++/*geiger*/
++
++	unsigned long page_adress;
++	struct mapping *map;
++	struct cache *pos, *tmpos;
++	if(ws == NULL)
++	{
++		ws = kmalloc(sizeof(struct working_set),GFP_KERNEL);
++		ws->map_tree = kmalloc(sizeof(struct radix_tree_root),GFP_KERNEL);
++		INIT_RADIX_TREE(ws->map_tree, GFP_ATOMIC);
++		ws->cachehead = kmalloc(sizeof(struct list_head),GFP_KERNEL);
++		INIT_LIST_HEAD(ws->cachehead);
++		ws->hist = kzalloc(HIST_SIZE*sizeof(unsigned int), GFP_KERNEL);
++		ws->ws_d = kthread_run(estimate_ws, NULL, "working-set");
++	}
++	struct radix_tree_root *map_tree = ws->map_tree;
++	struct list_head *cachehead = ws->cachehead;
++//	unsigned int *hist = ws->hist;
++
+ 
+ 	switch (req->operation) {
+ 	case BLKIF_OP_READ:
+@@ -686,6 +744,58 @@
+ 	xen_blkif_get(blkif);
+ 
+ 	for (i = 0; i < nseg; i++) {
++		page_adress = pfn_to_mfn(page_to_pfn(blkbk->pending_page(pending_req, i)));
++		map = radix_tree_lookup(ws->map_tree, page_adress);
++		//printk("11111111111111111111111111 device = %lu\n", preq.dev);
++		
++		if(operation == READ)
++		{
++			unsigned int dist = 0;
++			
++			list_for_each_entry_safe(pos,tmpos,cachehead, list)
++			{
++				if(pos->accessed == 0)
++				{
++					dist++;
++					if(preq.sector_number == pos->sector && preq.dev == pos->device)
++					{
++	
++						unsigned int index1 =  dist/1024;
++	//					printk("index1 = %lu\n", index1);
++						if(index1 < HIST_SIZE)
++							ws->hist[index1]++;
++						pos->accessed = 1;
++	//					list_del(&pos->list);
++				//		kfree(pos);
++				//		break;
++					}
++				}
++			}
++		}
++		if(map != NULL)
++		{
++			if(preq.sector_number != map->sector || map->device != preq.dev)
++			{
++				
++				struct cache *cache_entry;
++				cache_entry = kmalloc(sizeof(struct cache),GFP_KERNEL);
++
++				cache_entry->sector = map->sector;
++				cache_entry->device = map->device;
++				cache_entry->accessed = 0;
++				list_add(&cache_entry->list, ws->cachehead);
++
++				map->sector = preq.sector_number;
++				map->device = preq.dev;
++			}
++		}else
++		{
++			map = kmalloc(sizeof(struct mapping), GFP_KERNEL);
++			map->sector = preq.sector_number;
++			map->device = preq.dev;
++			radix_tree_insert(map_tree,page_adress, map);
++		}
++		
+ 		while ((bio == NULL) ||
+ 		       (bio_add_page(bio,
+ 				     blkbk->pending_page(pending_req, i),
+diff -ru linux-3.6/drivers/block/xen-blkback/common.h linux-3.6_1/drivers/block/xen-blkback/common.h
+--- linux-3.6/drivers/block/xen-blkback/common.h	2012-10-01 01:47:46.000000000 +0200
++++ linux-3.6_1/drivers/block/xen-blkback/common.h	2016-06-08 18:45:19.589603000 +0200
+@@ -158,10 +158,39 @@
+ 	struct block_device	*bdev;
+ 	/* Cached size parameter. */
+ 	sector_t		size;
+-	bool			flush_support;
+-	bool			discard_secure;
++	unsigned int            flush_support:1; 
++        unsigned int            discard_secure:1; 
++	//bool			flush_support;
++	//bool			discard_secure;
+ };
+ 
++struct mapping
++{
++        unsigned long sector;
++        unsigned int device;
++};
++
++
++struct cache
++{
++        struct list_head list;
++        unsigned long sector;
++        unsigned int device;
++        unsigned int accessed;
++};
++
++struct working_set{
++        struct list_head *cachehead;
++        struct radix_tree_root *map_tree;
++        unsigned int *hist;
++        struct task_struct      *ws_d;
++};
++
++
++
+ struct backend_info;
+ 
+ struct xen_blkif {
+@@ -236,65 +265,68 @@
+ struct xenbus_device *xen_blkbk_xenbus(struct backend_info *be);
+ 
+ static inline void blkif_get_x86_32_req(struct blkif_request *dst,
+-					struct blkif_x86_32_request *src)
++                                        struct blkif_x86_32_request *src)
+ {
+-	int i, n = BLKIF_MAX_SEGMENTS_PER_REQUEST;
+-	dst->operation = src->operation;
+-	switch (src->operation) {
+-	case BLKIF_OP_READ:
+-	case BLKIF_OP_WRITE:
+-	case BLKIF_OP_WRITE_BARRIER:
+-	case BLKIF_OP_FLUSH_DISKCACHE:
+-		dst->u.rw.nr_segments = src->u.rw.nr_segments;
+-		dst->u.rw.handle = src->u.rw.handle;
+-		dst->u.rw.id = src->u.rw.id;
+-		dst->u.rw.sector_number = src->u.rw.sector_number;
+-		barrier();
+-		if (n > dst->u.rw.nr_segments)
+-			n = dst->u.rw.nr_segments;
+-		for (i = 0; i < n; i++)
+-			dst->u.rw.seg[i] = src->u.rw.seg[i];
+-		break;
+-	case BLKIF_OP_DISCARD:
+-		dst->u.discard.flag = src->u.discard.flag;
+-		dst->u.discard.id = src->u.discard.id;
+-		dst->u.discard.sector_number = src->u.discard.sector_number;
+-		dst->u.discard.nr_sectors = src->u.discard.nr_sectors;
+-		break;
+-	default:
+-		break;
+-	}
++        int i, n = BLKIF_MAX_SEGMENTS_PER_REQUEST;
++        dst->operation = src->operation;
++        switch (src->operation) {
++        case BLKIF_OP_READ:
++        case BLKIF_OP_WRITE:
++        case BLKIF_OP_WRITE_BARRIER:
++        case BLKIF_OP_FLUSH_DISKCACHE:
++                dst->u.rw.nr_segments = src->u.rw.nr_segments;
++                dst->u.rw.handle = src->u.rw.handle;
++                dst->u.rw.id = src->u.rw.id;
++                dst->u.rw.sector_number = src->u.rw.sector_number;
++                barrier();
++                if (n > dst->u.rw.nr_segments)
++                        n = dst->u.rw.nr_segments;
++                for (i = 0; i < n; i++)
++                        dst->u.rw.seg[i] = src->u.rw.seg[i];
++                break;
++        case BLKIF_OP_DISCARD:
++                dst->u.discard.flag = src->u.discard.flag;
++                dst->u.discard.id = src->u.discard.id;
++                dst->u.discard.sector_number = src->u.discard.sector_number;
++                dst->u.discard.nr_sectors = src->u.discard.nr_sectors;
++                break;
++        default:
++                break;
++        }
+ }
+ 
+ static inline void blkif_get_x86_64_req(struct blkif_request *dst,
+-					struct blkif_x86_64_request *src)
++                                        struct blkif_x86_64_request *src)
+ {
+-	int i, n = BLKIF_MAX_SEGMENTS_PER_REQUEST;
+-	dst->operation = src->operation;
+-	switch (src->operation) {
+-	case BLKIF_OP_READ:
+-	case BLKIF_OP_WRITE:
+-	case BLKIF_OP_WRITE_BARRIER:
+-	case BLKIF_OP_FLUSH_DISKCACHE:
+-		dst->u.rw.nr_segments = src->u.rw.nr_segments;
+-		dst->u.rw.handle = src->u.rw.handle;
+-		dst->u.rw.id = src->u.rw.id;
+-		dst->u.rw.sector_number = src->u.rw.sector_number;
+-		barrier();
+-		if (n > dst->u.rw.nr_segments)
+-			n = dst->u.rw.nr_segments;
+-		for (i = 0; i < n; i++)
+-			dst->u.rw.seg[i] = src->u.rw.seg[i];
+-		break;
+-	case BLKIF_OP_DISCARD:
+-		dst->u.discard.flag = src->u.discard.flag;
+-		dst->u.discard.id = src->u.discard.id;
+-		dst->u.discard.sector_number = src->u.discard.sector_number;
+-		dst->u.discard.nr_sectors = src->u.discard.nr_sectors;
+-		break;
+-	default:
+-		break;
+-	}
++        int i, n = BLKIF_MAX_SEGMENTS_PER_REQUEST;
++        dst->operation = src->operation;
++        switch (src->operation) {
++        case BLKIF_OP_READ:
++        case BLKIF_OP_WRITE:
++        case BLKIF_OP_WRITE_BARRIER:
++        case BLKIF_OP_FLUSH_DISKCACHE:
++                dst->u.rw.nr_segments = src->u.rw.nr_segments;
++                dst->u.rw.handle = src->u.rw.handle;
++                dst->u.rw.id = src->u.rw.id;
++                dst->u.rw.sector_number = src->u.rw.sector_number;
++                barrier();
++                if (n > dst->u.rw.nr_segments)
++                        n = dst->u.rw.nr_segments;
++                for (i = 0; i < n; i++)
++                        dst->u.rw.seg[i] = src->u.rw.seg[i];
++                break;
++        case BLKIF_OP_DISCARD:
++                dst->u.discard.flag = src->u.discard.flag;
++                dst->u.discard.id = src->u.discard.id;
++                dst->u.discard.sector_number = src->u.discard.sector_number;
++                dst->u.discard.nr_sectors = src->u.discard.nr_sectors;
++                break;
++        default:
++                break;
++        }
+ }
+ 
++
++
++
+ #endif /* __XEN_BLKIF__BACKEND__COMMON_H__ */

@@ -1,0 +1,7 @@
+This folder contains patches for 4 WSS estimation methods: Geiger, Zballoond(selfballoon), VMware, and Exclusive Cache. The folder also provides the scripts to update the VM's memory acording to the estimation. In the folder scripts, there is one script which represents our soluition which is a mix between Geiger and VMware. 
+
+We also provide sone syntetic benchmarks used to evaluate the estimations.
+
+To find out how to apply the patches please see the patch file. 
+
+We also provide an example of VM configuration file we used. 

@@ -1,0 +1,288 @@
+#this patch shoud be applied on linux-3.6
+#download it from here https://www.linux-mips.org/pub/linux/mips/kernel/v3.x/linux-3.6.tar.gz
+
+diff -ru test/geiger/linux-3.6/drivers/block/xen-blkfront.c test/e-cache/DomU/linux-3.6/drivers/block/xen-blkfront.c
+--- test/geiger/linux-3.6/drivers/block/xen-blkfront.c	2012-10-01 01:47:46.000000000 +0200
++++ test/e-cache/DomU/linux-3.6/drivers/block/xen-blkfront.c	2016-06-16 03:27:51.083266511 +0200
+@@ -135,7 +135,12 @@
+ static int get_id_from_freelist(struct blkfront_info *info)
+ {
+ 	unsigned long free = info->shadow_free;
+-	BUG_ON(free >= BLK_RING_SIZE);
++	if(free >= BLK_RING_SIZE)
++	{
++	//	printk("wrong id : %lu", free);
++		return free;
++	}
++//	BUG_ON(free >= BLK_RING_SIZE);
+ 	info->shadow_free = info->shadow[free].req.u.rw.id;
+ 	info->shadow[free].req.u.rw.id = 0x0fffffee; /* debug */
+ 	return free;
+@@ -146,7 +151,7 @@
+ {
+ 	if (info->shadow[id].req.u.rw.id != id)
+ 		return -EINVAL;
+-	if (info->shadow[id].request == NULL)
++	if ((info->shadow[id].request == NULL) && (info->shadow[id].req.operation != BLKIF_OP_EVICTION))
+ 		return -EINVAL;
+ 	info->shadow[id].req.u.rw.id  = info->shadow_free;
+ 	info->shadow[id].request = NULL;
+@@ -161,7 +166,8 @@
+ 		[BLKIF_OP_WRITE] = "write",
+ 		[BLKIF_OP_WRITE_BARRIER] = "barrier",
+ 		[BLKIF_OP_FLUSH_DISKCACHE] = "flush",
+-		[BLKIF_OP_DISCARD] = "discard" };
++		[BLKIF_OP_DISCARD] = "discard",
++		[BLKIF_OP_EVICTION] = "evictin" };
+ 
+ 	if (op < 0 || op >= ARRAY_SIZE(names))
+ 		return "unknown";
+@@ -273,6 +279,8 @@
+ 	return 0;
+ }
+ 
++static struct blkfront_info * my_info = NULL;
++
+ /*
+  * Generate a Xen blkfront IO request from a blk layer request.  Reads
+  * and writes are handled as expected.
+@@ -290,6 +298,10 @@
+ 	grant_ref_t gref_head;
+ 	struct scatterlist *sg;
+ 
++	if(my_info == NULL)
++		my_info = info;
++	
++
+ 	if (unlikely(info->connected != BLKIF_STATE_CONNECTED))
+ 		return 1;
+ 
+@@ -306,6 +318,8 @@
+ 	/* Fill out a communications ring structure. */
+ 	ring_req = RING_GET_REQUEST(&info->ring, info->ring.req_prod_pvt);
+ 	id = get_id_from_freelist(info);
++	if(id >= BLK_RING_SIZE)
++		return 1;
+ 	info->shadow[id].request = req;
+ 
+ 	ring_req->u.rw.id = id;
+@@ -384,6 +398,122 @@
+ 		notify_remote_via_irq(info->irq);
+ }
+ 
++
++
++static void blkif_offer_page(struct page **pages, unsigned int count)
++{
++	struct blkif_request  * ring_req;
++	grant_ref_t gref_head; // ref;
++	long unsigned int id;
++	unsigned int i, ref;
++	unsigned long buffer_mfn;
++
++printk("111111111111111111111111111111111111111111111111\n");
++
++	goto after_again;
++	again:
++	for(i = 0; i<100;i++);
++after_again:
++//	printk("try\n");
++	if (RING_FULL(&my_info->ring))
++	{
++		printk("ring is full\n");
++		goto again;
++	}
++printk("222222222222222222222222222222222222222222222222\n");
++	ring_req  = RING_GET_REQUEST(&my_info->ring, my_info->ring.req_prod_pvt);
++printk("333333333333333333333333333333333333333333333333\n");
++	id = get_id_from_freelist(my_info);
++printk("444444444444444444444444444444444444444444444444\n");
++	if(id >= BLK_RING_SIZE)
++	{
++		printk("invalid grant\n");
++		return;
++	}
++printk("555555555555555555555555555555555555555555555555\n");
++	ring_req->operation = BLKIF_OP_EVICTION;
++	printk("\t >>>>>>>>>>>>>>>>111111111111111\n");
++	ring_req->u.rw.nr_segments = count;
++	printk("\t >>>>>>>>>>>>>>>>222222222222222\n");
++	ring_req->u.rw.id = id;
++	printk("\t >>>>>>>>>>>>>>>>333333333333333\n");
++	ring_req->u.rw.handle = my_info->handle;
++	printk("\t >>>>>>>>>>>>>>>>444444444444444\n");
++
++printk("666666666666666666666666666666666666666666666666\n");
++	if(gnttab_alloc_grant_references(count, &gref_head)<0)
++	{
++		printk("\t >>>>>>>>>>>>>>>>111111111111111\n");
++		gnttab_request_free_callback(&my_info->callback,blkif_restart_queue_callback,my_info,count);
++		printk("\t >>>>>>>>>>>>>>>>222222222222222\n");
++		printk("alloc grant failed: No space\n");
++		return;
++	}
++int temp1 = (int)ref;
++printk("777777777777777777777777777777777777777777777777\n");
++	for(i=0; i<count; i++)
++	{
++		printk("\t >>>>>>>>>>>>>>>>111111111111111\n");
++		buffer_mfn = pfn_to_mfn(page_to_pfn(pages[i]));
++		printk("\t >>>>>>>>>>>>>>>>222222222222222\n");
++                ref = gnttab_claim_grant_reference(&gref_head);
++		printk("\t >>>>>>>>>>>>>>>>333333333333333\n");
++		temp1 = (int)ref;	
++		printk("\t >>>>>>>>>>>>>>>>  ref=");
++		printk("%x",ref);
++		printk("   >>>>>>>>>>>>>>>>");
++		printk("%d",temp1);
++		printk("   >>>>>>>>>>>>>>>>\n");
++              		 if (temp1 <1) return;
++				  
++		printk("\t >>>>>>>>>>>>>>>>  dom_id=");
++                printk("%d",my_info->xbdev->otherend_id);
++                printk("   >>>>>>>>>>>>>>>>\n");
++		
++
++		printk("\t >>>>>>>>>>>>>>>> buffer_mfn= ");
++                printk("%lu",buffer_mfn);
++                printk("   >>>>>>>>>>>>>>>>\n");
++
++
++		
++		gnttab_grant_foreign_access_ref(
++                             ref,
++                             my_info->xbdev->otherend_id,
++                             buffer_mfn,
++                             1);
++		printk("\t >>>>>>>>>>>>>>>>444444444444444\n");
++
++		ring_req->u.rw.seg[i] = (struct blkif_request_segment) {
++			.gref       = ref,
++			};
++		printk("\t >>>>>>>>>>>>>>>>555555555555555\n");
++		my_info->shadow[id].frame[i] = mfn_to_pfn(buffer_mfn);
++		printk("\t >>>>>>>>>>>>>>>>666666666666666\n");
++	}
++
++printk("888888888888888888888888888888888888888888888888\n");
++	my_info->ring.req_prod_pvt++;
++	printk("\t >>>>>>>>>>>>>>>>111111111111111\n");
++
++	my_info->shadow[id].req = *ring_req;
++	printk("\t >>>>>>>>>>>>>>>>222222222222222\n");
++
++	gnttab_free_grant_references(gref_head);
++	printk("\t >>>>>>>>>>>>>>>>33333333333333\n");
++	
++	flush_requests(my_info);
++
++printk("999999999999999999999999999999999999999999999999\n");
++}
++
++
++
++
++
++void (*offer_page)(struct page **pages, unsigned int count) =  blkif_offer_page;
++
++
+ /*
+  * do_blkif_request
+  *  read a block; request is in a request queue
+@@ -670,7 +800,7 @@
+ 	spin_unlock_irqrestore(&info->io_lock, flags);
+ 
+ 	/* Flush gnttab callback work. Must be done with no locks held. */
+-	flush_work_sync(&info->work);
++	flush_work(&info->work);
+ 
+ 	del_gendisk(info->gd);
+ 
+@@ -719,7 +849,7 @@
+ 	spin_unlock_irq(&info->io_lock);
+ 
+ 	/* Flush gnttab callback work. Must be done with no locks held. */
+-	flush_work_sync(&info->work);
++	flush_work(&info->work);
+ 
+ 	/* Free resources associated with old device channel. */
+ 	if (info->ring_ref != GRANT_INVALID_REF) {
+@@ -773,6 +903,7 @@
+ 		 * never have given to it (we stamp it up to BLK_RING_SIZE -
+ 		 * look in get_id_from_freelist.
+ 		 */
++		 //printk("irq interrupt %lu\n",id);
+ 		if (id >= BLK_RING_SIZE) {
+ 			WARN(1, "%s: response to %s has incorrect id (%ld)\n",
+ 			     info->gd->disk_name, op_name(bret->operation), id);
+@@ -835,6 +966,8 @@
+ 
+ 			__blk_end_request_all(req, error);
+ 			break;
++		case BLKIF_OP_EVICTION:
++			break;
+ 		default:
+ 			BUG();
+ 		}
+diff -ru test/geiger/linux-3.6/include/linux/blkdev.h test/e-cache/DomU/linux-3.6/include/linux/blkdev.h
+--- test/geiger/linux-3.6/include/linux/blkdev.h	2012-10-01 01:47:46.000000000 +0200
++++ test/e-cache/DomU/linux-3.6/include/linux/blkdev.h	2016-06-16 02:24:52.710938364 +0200
+@@ -1463,3 +1463,6 @@
+ #endif /* CONFIG_BLOCK */
+ 
+ #endif
++
++
++extern void (*offer_page)(struct page **pages, unsigned int count); //Aram 
+diff -ru test/geiger/linux-3.6/include/xen/interface/io/blkif.h test/e-cache/DomU/linux-3.6/include/xen/interface/io/blkif.h
+--- test/geiger/linux-3.6/include/xen/interface/io/blkif.h	2012-10-01 01:47:46.000000000 +0200
++++ test/e-cache/DomU/linux-3.6/include/xen/interface/io/blkif.h	2016-06-16 02:19:58.946923366 +0200
+@@ -102,6 +102,9 @@
+  */
+ #define BLKIF_OP_DISCARD           5
+ 
++#define BLKIF_OP_EVICTION	6
++
++
+ /*
+  * Maximum scatter/gather segments per request.
+  * This is carefully chosen so that sizeof(struct blkif_ring) <= PAGE_SIZE.
+diff -ru test/geiger/linux-3.6/mm/vmscan.c test/e-cache/DomU/linux-3.6/mm/vmscan.c
+--- test/geiger/linux-3.6/mm/vmscan.c	2012-10-01 01:47:46.000000000 +0200
++++ test/e-cache/DomU/linux-3.6/mm/vmscan.c	2016-06-16 02:18:22.758922261 +0200
+@@ -668,6 +668,10 @@
+ 	return PAGEREF_RECLAIM;
+ }
+ 
++
++static  struct page* evicted_pool[11]; //e-cache
++static unsigned int index = 0;		//e-cache
++
+ /*
+  * shrink_page_list() returns the number of reclaimed pages
+  */
+@@ -917,7 +921,23 @@
+ 		 * Is there need to periodically free_page_list? It would
+ 		 * appear not as the counts should be low
+ 		 */
+-		list_add(&page->lru, &free_pages);
++		
++		if(index < 10)
++		{	
++			evicted_pool[index] = page;
++			index ++;
++		}
++		else
++		{ 
++			unsigned int i = 0;
++			evicted_pool[index] = page;
++			index = 0;
++			offer_page(evicted_pool, 11);
++			for(i=0; i<11; i++)
++				list_add(&evicted_pool[i]->lru, &free_pages);
++//				list_add(&page->lru,&free_pages);
++		}
++		
+ 		continue;
+ 
+ cull_mlocked:

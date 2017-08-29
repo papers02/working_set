@@ -1,0 +1,485 @@
+#this patch shoud be applied on linux-3.6
+#download it from here https://www.linux-mips.org/pub/linux/mips/kernel/v3.x/linux-3.19.tar.gz
+
+diff -ru test/e-cache/DomU/wrong/linux-3.19/drivers/block/xen-blkfront.c xenballoon/linux-3.19/drivers/block/xen-blkfront.c
+--- test/e-cache/DomU/wrong/linux-3.19/drivers/block/xen-blkfront.c	2015-02-09 03:54:22.000000000 +0100
++++ xenballoon/linux-3.19/drivers/block/xen-blkfront.c	2015-07-20 11:27:04.000000000 +0200
+@@ -379,6 +379,11 @@
+ 	return 0;
+ }
+ 
++/*working-set*/
++static struct radix_tree_root *map_sector = NULL; //bitmap pour les blocks
++static unsigned int *val = NULL;
++unsigned int ref_cp = 0; // compteur des refaults
++EXPORT_SYMBOL(ref_cp);
+ /*
+  * Generate a Xen blkfront IO request from a blk layer request.  Reads
+  * and writes are handled as expected.
+@@ -404,6 +409,15 @@
+ 	struct grant *gnt_list_entry = NULL;
+ 	struct scatterlist *sg;
+ 	int nseg, max_grefs;
++	unsigned int secteur;
++
++	//initialisation de map_sector
++	if(map_sector == NULL)
++	{
++		map_sector = kmalloc(sizeof(struct radix_tree_root),GFP_KERNEL);
++		INIT_RADIX_TREE(map_sector, GFP_ATOMIC);
++		val = kmalloc(sizeof(unsigned int),GFP_KERNEL);
++	}
+ 
+ 	if (unlikely(info->connected != BLKIF_STATE_CONNECTED))
+ 		return 1;
+@@ -453,6 +467,7 @@
+ 		       req->nr_phys_segments > info->max_indirect_segments);
+ 		nseg = blk_rq_map_sg(req->q, req, info->shadow[id].sg);
+ 		ring_req->u.rw.id = id;
++		secteur = blk_rq_pos(req);
+ 		if (nseg > BLKIF_MAX_SEGMENTS_PER_REQUEST) {
+ 			/*
+ 			 * The indirect operation can only be a BLKIF_OP_READ or
+@@ -495,9 +510,18 @@
+ 			ring_req->u.rw.nr_segments = nseg;
+ 		}
+ 		for_each_sg(info->shadow[id].sg, sg, nseg, i) {
++			unsigned int *tmp;
+ 			fsect = sg->offset >> 9;
+ 			lsect = fsect + (sg->length >> 9) - 1;
+-
++			secteur += (sg->length >> 9); 
++			tmp = radix_tree_lookup(map_sector, secteur);
++			if(tmp != NULL) //le seccteur est déja accédé donc refault
++			{
++				ref_cp++;
++			}else //premier accès
++			{
++				radix_tree_insert(map_sector,secteur, val);
++			}
+ 			if ((ring_req->operation == BLKIF_OP_INDIRECT) &&
+ 			    (i % SEGS_PER_INDIRECT_FRAME == 0)) {
+ 				unsigned long uninitialized_var(pfn);
+diff -ru test/e-cache/DomU/wrong/linux-3.19/drivers/xen/Makefile xenballoon/linux-3.19/drivers/xen/Makefile
+--- test/e-cache/DomU/wrong/linux-3.19/drivers/xen/Makefile	2015-02-09 03:54:22.000000000 +0100
++++ xenballoon/linux-3.19/drivers/xen/Makefile	2015-06-06 19:01:23.000000000 +0200
+@@ -20,6 +20,7 @@
+ obj-$(CONFIG_BLOCK)			+= biomerge.o
+ obj-$(CONFIG_XEN_BALLOON)		+= xen-balloon.o
+ obj-$(CONFIG_XEN_SELFBALLOONING)	+= xen-selfballoon.o
++obj-y								+= xen-twsballoon.o
+ obj-$(CONFIG_XEN_DEV_EVTCHN)		+= xen-evtchn.o
+ obj-$(CONFIG_XEN_GNTDEV)		+= xen-gntdev.o
+ obj-$(CONFIG_XEN_GRANT_DEV_ALLOC)	+= xen-gntalloc.o
+diff -ru test/e-cache/DomU/wrong/linux-3.19/drivers/xen/tmem.c xenballoon/linux-3.19/drivers/xen/tmem.c
+--- test/e-cache/DomU/wrong/linux-3.19/drivers/xen/tmem.c	2015-02-09 03:54:22.000000000 +0100
++++ xenballoon/linux-3.19/drivers/xen/tmem.c	2015-06-06 21:05:43.000000000 +0200
+@@ -37,7 +37,9 @@
+ static bool cleancache __read_mostly = true;
+ module_param(cleancache, bool, S_IRUGO);
+ static bool selfballooning __read_mostly = true;
++static bool twsballooning __read_mostly = true;
+ module_param(selfballooning, bool, S_IRUGO);
++module_param(twsballooning, bool, S_IRUGO);
+ #endif /* CONFIG_CLEANCACHE */
+ 
+ #ifdef CONFIG_FRONTSWAP
+@@ -49,7 +51,9 @@
+ 
+ #ifdef CONFIG_XEN_SELFBALLOONING
+ static bool selfshrinking __read_mostly = true;
++static bool twsshrinking __read_mostly = true;
+ module_param(selfshrinking, bool, S_IRUGO);
++module_param(twsshrinking, bool, S_IRUGO);
+ #endif /* CONFIG_XEN_SELFBALLOONING */
+ 
+ #define TMEM_CONTROL               0
+@@ -414,8 +418,11 @@
+ 	if (!frontswap) {
+ 		selfshrinking = false;
+ 		selfballooning = false;
++		twsshrinking = false;
++		twsballooning = false;
+ 	}
+ 	xen_selfballoon_init(selfballooning, selfshrinking);
++	xen_twsballoon_init(twsballooning, twsshrinking);
+ #endif
+ 	return 0;
+ }
+diff -ru test/e-cache/DomU/wrong/linux-3.19/drivers/xen/xen-balloon.c xenballoon/linux-3.19/drivers/xen/xen-balloon.c
+--- test/e-cache/DomU/wrong/linux-3.19/drivers/xen/xen-balloon.c	2015-02-09 03:54:22.000000000 +0100
++++ xenballoon/linux-3.19/drivers/xen/xen-balloon.c	2015-06-07 02:34:17.000000000 +0200
+@@ -102,6 +102,7 @@
+ 	register_balloon(&balloon_dev);
+ 
+ 	register_xen_selfballooning(&balloon_dev);
++	register_xen_twsballooning(&balloon_dev);
+ 
+ 	register_xenstore_notifier(&xenstore_notifier);
+ 
+diff -ru test/e-cache/DomU/wrong/linux-3.19/drivers/xen/xen-selfballoon.c xenballoon/linux-3.19/drivers/xen/xen-selfballoon.c
+--- test/e-cache/DomU/wrong/linux-3.19/drivers/xen/xen-selfballoon.c	2015-02-09 03:54:22.000000000 +0100
++++ xenballoon/linux-3.19/drivers/xen/xen-selfballoon.c	2015-06-07 02:40:59.000000000 +0200
+@@ -187,7 +187,7 @@
+ 	unsigned long cur_pages, goal_pages, tgt_pages, floor_pages;
+ 	unsigned long useful_pages;
+ 	bool reset_timer = false;
+-
++	printk("processing selfballoon\n");
+ 	if (xen_selfballooning_enabled) {
+ 		cur_pages = totalram_pages;
+ 		tgt_pages = cur_pages; /* default is no change */
+@@ -528,7 +528,7 @@
+ {
+ 	bool enable = false;
+ 	unsigned long reserve_pages;
+-
++	printk("<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<self init<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n");
+ 	if (!xen_domain())
+ 		return -ENODEV;
+ 
+diff -ru test/e-cache/DomU/wrong/linux-3.19/include/xen/balloon.h xenballoon/linux-3.19/include/xen/balloon.h
+--- test/e-cache/DomU/wrong/linux-3.19/include/xen/balloon.h	2015-02-09 03:54:22.000000000 +0100
++++ xenballoon/linux-3.19/include/xen/balloon.h	2015-06-07 02:50:08.000000000 +0200
+@@ -35,6 +35,7 @@
+ struct device;
+ #ifdef CONFIG_XEN_SELFBALLOONING
+ extern int register_xen_selfballooning(struct device *dev);
++extern int register_xen_twsballooning(struct device *dev);
+ #else
+ static inline int register_xen_selfballooning(struct device *dev)
+ {
+diff -ru test/e-cache/DomU/wrong/linux-3.19/include/xen/tmem.h xenballoon/linux-3.19/include/xen/tmem.h
+--- test/e-cache/DomU/wrong/linux-3.19/include/xen/tmem.h	2015-02-09 03:54:22.000000000 +0100
++++ xenballoon/linux-3.19/include/xen/tmem.h	2015-06-06 20:12:56.000000000 +0200
+@@ -9,7 +9,7 @@
+ /* defined in drivers/xen/tmem.c */
+ extern bool tmem_enabled;
+ #endif
+-
++extern int xen_twsballoon_init(bool, bool);
+ #ifdef CONFIG_XEN_SELFBALLOONING
+ extern int xen_selfballoon_init(bool, bool);
+ #endif
+--- /dev/null	2017-05-12 08:58:38.659309118 +0200
++++ linux-3.19/drivers/xen/xen-twsballoon.c	2017-05-10 20:06:24.323465981 +0200
+@@ -0,0 +1,319 @@
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/kernel.h>
++#include <linux/bootmem.h>
++#include <linux/swap.h>
++#include <linux/mm.h>
++#include <linux/mman.h>
++#include <linux/module.h>
++#include <linux/workqueue.h>
++#include <linux/device.h>
++#include <xen/balloon.h>
++#include <xen/tmem.h>
++#include <xen/xen.h>
++#include <linux/slab.h>
++/*working-set*/
++/* Enable/disable with sysfs. */
++static int xen_twsballooning_enabled __read_mostly;
++
++/* In HZ, controls frequency of worker invocation. */
++static unsigned int twsballoon_interval __read_mostly = 1;
++enum states {
++  FAST,
++  SLOW,
++  COOL_DOWN
++};
++static enum states state;
++static enum states previous_state;
++static unsigned long * vm_events;
++static unsigned long  pswpin, refault_count;
++unsigned long cas;
++static unsigned int clock;
++
++static unsigned int twsballoon_min_usable_mb;
++
++static unsigned int twsballoon_reserved_mb;
++
++static void twsballoon_process(struct work_struct *work);
++static DECLARE_DELAYED_WORK(twsballoon_worker, twsballoon_process);
++
++
++
++#define MB2PAGES(mb)	((mb) << (20 - PAGE_SHIFT))
++#define PAGES2MB(pages) ((pages) >> (20 - PAGE_SHIFT))
++extern unsigned int ref_cp;
++
++static void twsballoon_process(struct work_struct *work)
++{
++	unsigned long cur_pages, goal_pages, tgt_pages, floor_pages;
++	unsigned long useful_pages;
++	bool reset_timer = false;
++	unsigned long tmp;
++	unsigned long curr_cas;
++	unsigned long delta, delta_ref;
++	unsigned long val;
++	if (xen_twsballooning_enabled) {
++		curr_cas = vm_memory_committed(); // committed-as
++		all_vm_events(vm_events); 
++		tmp = vm_events[PSWPIN]; //nombre de swapin
++		delta = tmp -pswpin;
++		delta_ref = ref_cp - refault_count; //nombre de refault
++		pswpin  = tmp;
++		refault_count = ref_cp;
++		cur_pages = totalram_pages;
++		tgt_pages = cur_pages; 
++//Machine à état
++		switch(state) {
++			case FAST:
++				if(cas != curr_cas)
++				{
++					tgt_pages = curr_cas;
++					cas = curr_cas;
++					break;
++				}
++				if(delta!=0 || delta_ref != 0)
++				{
++					state = COOL_DOWN;
++					tgt_pages = cur_pages+delta + delta_ref;
++					clock = 8;
++					break;
++				}
++				tgt_pages = cur_pages-5*cur_pages/100;
++				break;
++			case COOL_DOWN:
++				if(cas != curr_cas)
++				{
++					tgt_pages = curr_cas;
++					cas = 	curr_cas;
++					state = FAST;
++					break;
++				}
++				if(delta != 0 || delta_ref != 0)
++				{
++					tgt_pages = cur_pages+delta+delta_ref;
++					clock = 8;
++					break;
++				}
++				if(clock == 0){
++					state = SLOW;
++					break;
++				}
++				clock --;
++				break;
++			case SLOW:
++				if(cas != curr_cas)
++				{
++					tgt_pages = curr_cas;
++					cas = curr_cas;
++					state = FAST;
++					break;
++				}
++				if(delta != 0 || delta_ref != 0)
++				{
++					tgt_pages = cur_pages+delta + delta_ref;
++					clock = 8;
++					state = COOL_DOWN;
++					break;
++				}
++				tgt_pages = cur_pages-1*cur_pages/100;
++				break;
++		}
++		floor_pages = totalreserve_pages + MB2PAGES(60);
++		if (tgt_pages < floor_pages)
++		{
++			tgt_pages = floor_pages;
++		}else if (tgt_pages > MB2PAGES(2048))
++			tgt_pages = MB2PAGES(2048);
++		val = tgt_pages ;
++		balloon_set_new_target(tgt_pages +
++                        balloon_stats.current_pages - totalram_pages);
++		reset_timer = true;
++	}
++	if (reset_timer)
++		schedule_delayed_work(&twsballoon_worker,
++			twsballoon_interval * HZ);
++}
++
++#ifdef CONFIG_SYSFS
++
++#include <linux/capability.h>
++
++#define TWSBALLOON_SHOW(name, format, args...)				\
++	static ssize_t show_##name(struct device *dev,	\
++					  struct device_attribute *attr, \
++					  char *buf) \
++	{ \
++		return sprintf(buf, format, ##args); \
++	}
++
++TWSBALLOON_SHOW(twsballooning, "%d\n", xen_twsballooning_enabled);
++
++static ssize_t store_twsballooning(struct device *dev,
++			    struct device_attribute *attr,
++			    const char *buf,
++			    size_t count)
++{
++	bool was_enabled = xen_twsballooning_enabled;
++	unsigned long tmp;
++	int err;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	err = kstrtoul(buf, 10, &tmp);
++	if (err)
++		return err;
++	if ((tmp != 0) && (tmp != 1))
++		return -EINVAL;
++
++	xen_twsballooning_enabled = !!tmp;
++	state = FAST;
++	vm_events = kmalloc(NR_VM_EVENT_ITEMS*sizeof(unsigned long),GFP_KERNEL);
++	if (!was_enabled && xen_twsballooning_enabled)
++		schedule_delayed_work(&twsballoon_worker,
++			twsballoon_interval * HZ);
++
++	return count;
++}
++
++static DEVICE_ATTR(twsballooning, S_IRUGO | S_IWUSR,
++		   show_twsballooning, store_twsballooning);
++
++TWSBALLOON_SHOW(twsballoon_interval, "%d\n", twsballoon_interval);
++
++static ssize_t store_twsballoon_interval(struct device *dev,
++					  struct device_attribute *attr,
++					  const char *buf,
++					  size_t count)
++{
++	unsigned long val;
++	int err;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	err = kstrtoul(buf, 10, &val);
++	if (err)
++		return err;
++	if (val == 0)
++		return -EINVAL;
++	twsballoon_interval = val;
++	return count;
++}
++
++static DEVICE_ATTR(twsballoon_interval, S_IRUGO | S_IWUSR,
++		   show_twsballoon_interval, store_twsballoon_interval);
++
++
++
++TWSBALLOON_SHOW(twsballoon_min_usable_mb, "%d\n",
++				twsballoon_min_usable_mb);
++
++static ssize_t store_twsballoon_min_usable_mb(struct device *dev,
++					       struct device_attribute *attr,
++					       const char *buf,
++					       size_t count)
++{
++	unsigned long val;
++	int err;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	err = kstrtoul(buf, 10, &val);
++	if (err)
++		return err;
++	if (val == 0)
++		return -EINVAL;
++	twsballoon_min_usable_mb = val;
++	return count;
++}
++
++static DEVICE_ATTR(twsballoon_min_usable_mb, S_IRUGO | S_IWUSR,
++		   show_twsballoon_min_usable_mb,
++		   store_twsballoon_min_usable_mb);
++
++TWSBALLOON_SHOW(twsballoon_reserved_mb, "%d\n",
++				twsballoon_reserved_mb);
++
++static ssize_t store_twsballoon_reserved_mb(struct device *dev,
++					     struct device_attribute *attr,
++					     const char *buf,
++					     size_t count)
++{
++	unsigned long val;
++	int err;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	err = kstrtoul(buf, 10, &val);
++	if (err)
++		return err;
++	if (val == 0)
++		return -EINVAL;
++	twsballoon_reserved_mb = val;
++	return count;
++}
++
++static DEVICE_ATTR(twsballoon_reserved_mb, S_IRUGO | S_IWUSR,
++		   show_twsballoon_reserved_mb,
++		   store_twsballoon_reserved_mb);
++
++
++
++
++static struct attribute *twsballoon_attrs[] = {
++	&dev_attr_twsballooning.attr,
++	&dev_attr_twsballoon_interval.attr,
++	
++	&dev_attr_twsballoon_min_usable_mb.attr,
++	&dev_attr_twsballoon_reserved_mb.attr,
++	NULL
++};
++
++static const struct attribute_group twsballoon_group = {
++	.name = "twsballoon",
++	.attrs = twsballoon_attrs
++};
++#endif
++
++int register_xen_twsballooning(struct device *dev)
++{
++	int error = -1;
++
++#ifdef CONFIG_SYSFS
++	error = sysfs_create_group(&dev->kobj, &twsballoon_group);
++#endif
++	return error;
++}
++EXPORT_SYMBOL(register_xen_twsballooning);
++
++int xen_twsballoon_init(bool use_twsballooning, bool use_frontswap_twsshrink)
++{
++	bool enable = false;
++	unsigned long reserve_pages;
++
++	if (!xen_domain())
++		return -ENODEV;
++
++	if (xen_initial_domain()) {
++		pr_info("Xen twsballooning driver disabled for domain0\n");
++		return -ENODEV;
++	}
++
++	xen_twsballooning_enabled = tmem_enabled && use_twsballooning;
++	if (xen_twsballooning_enabled) {
++		pr_info("Initializing Xen twsballooning driver\n");
++		enable = true;
++	}
++
++	if (!enable)
++		return -ENODEV;
++
++	if (!twsballoon_reserved_mb) {
++		reserve_pages = totalram_pages / 10;
++		twsballoon_reserved_mb = PAGES2MB(reserve_pages);
++	}
++	schedule_delayed_work(&twsballoon_worker, twsballoon_interval * HZ);
++
++	return 0;
++}
++EXPORT_SYMBOL(xen_twsballoon_init);
